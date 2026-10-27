@@ -1,0 +1,218 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 524155d..fc45a66 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -396,6 +396,7 @@
+ 469	common	file_setattr		sys_file_setattr
+ 470	common	listns			sys_listns
+ 471	common	rseq_slice_yield	sys_rseq_slice_yield
++472	common	k22tree			sys_k22tree
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/include/uapi/linux/k22info.h b/include/uapi/linux/k22info.h
+new file mode 100644
+index 0000000..fb4ab7a
+--- /dev/null
++++ b/include/uapi/linux/k22info.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_K22INFO_H
++#define _UAPI_LINUX_K22INFO_H
++
++#include <linux/types.h>
++
++struct k22info {
++	char comm[64];
++	__kernel_pid_t pid;
++	__kernel_pid_t parent_pid;
++	__kernel_pid_t first_child_pid;
++	__kernel_pid_t next_sibling_pid;
++	unsigned long nvcsw;
++	unsigned long nivcsw;
++	unsigned long start_time;
++	unsigned long userpc;
++	unsigned long kernelpc;
++};
++
++#endif
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 1e1a316..3de1481 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,7 @@ obj-y     = fork.o exec_domain.o exec_state.o panic.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o nstree.o nscommon.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
++	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o k22tree.o
+ 
+ obj-$(CONFIG_MULTIUSER) += groups.o
+ obj-$(CONFIG_VHOST_TASK) += vhost_task.o
+diff --git a/kernel/k22tree.c b/kernel/k22tree.c
+new file mode 100644
+index 0000000..d25e4be
+--- /dev/null
++++ b/kernel/k22tree.c
+@@ -0,0 +1,152 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * k22tree: copy the process tree to user space in DFS order.
++ */
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/stat.h>
++#include <linux/sched/task.h>
++#include <linux/sched/task_stack.h>
++#include <linux/ptrace.h>
++#include <asm/switch_to.h>
++#include <linux/k22info.h>
++
++/* Filter out threads and zombies; only active main processes are returned. */
++static bool is_proc(struct task_struct *t)
++{
++	return thread_group_leader(t) && !t->exit_state;
++}
++
++/*
++ * A child is stored in the children list of the thread that forked it.
++ * Search all threads in the process to find its children.
++ */
++static struct task_struct *first_child(struct task_struct *p)
++{
++	struct task_struct *th, *c;
++
++	for_each_thread(p, th)
++		list_for_each_entry(c, &th->children, sibling)
++			if (is_proc(c))
++				return c;
++	return NULL;
++}
++
++/*
++ * A process's children may be attached to different threads in its thread
++ * group. Walk the remaining entries in this thread's list, then the child
++ * lists of the other threads in the order used by first_child().
++ */
++static struct task_struct *next_sibling(struct task_struct *t)
++{
++	struct task_struct *parent = t->real_parent;
++	struct task_struct *th;
++	struct task_struct *leader = parent->group_leader;
++	struct task_struct *s;
++
++	if (t == &init_task)
++		return NULL;
++
++	for (s = list_next_entry(t, sibling); &s->sibling != &parent->children;
++	     s = list_next_entry(s, sibling))
++		if (is_proc(s))
++			return s;
++
++	th = next_thread(parent);
++	while (th != leader) {
++		list_for_each_entry(s, &th->children, sibling)
++			if (is_proc(s))
++				return s;
++		th = next_thread(th);
++	}
++
++	return NULL;
++}
++
++/* Return the saved kernel instruction pointer of a task. */
++static unsigned long kernel_pc(struct task_struct *t)
++{
++	if (task_curr(t))
++		return 0;
++#ifdef CONFIG_X86_64
++	return ((struct inactive_task_frame *)t->thread.sp)->ret_addr;
++#elif defined(CONFIG_ARM64)
++	return t->thread.cpu_context.pc;
++#else
++	return 0;
++#endif
++}
++
++/* Fill a k22info structure with information about a process. */
++static void fill(struct k22info *i, struct task_struct *t,
++		 struct task_struct *child, struct task_struct *sib)
++{
++	memset(i, 0, sizeof(*i));
++
++	get_task_comm(i->comm, t);
++	i->pid = task_pid_nr(t);
++	i->parent_pid = (t == &init_task) ? 0 : task_tgid_nr(t->real_parent);
++	i->first_child_pid = child ? task_pid_nr(child) : 0;
++	i->next_sibling_pid = sib ? task_pid_nr(sib) : 0;
++	i->nvcsw = t->nvcsw;
++	i->nivcsw = t->nivcsw;
++	i->start_time = t->start_time;
++
++	if (!(t->flags & (PF_KTHREAD | PF_IO_WORKER)))
++		i->userpc = instruction_pointer(task_pt_regs(t));
++
++	i->kernelpc = kernel_pc(t);
++}
++
++SYSCALL_DEFINE2(k22tree, struct k22info __user *, buf, int __user *, ne)
++{
++	struct task_struct *p, *child, *sib, *next;
++	struct k22info *kbuf;
++	int max, n = 0, ret = 0;
++
++	if (!buf || !ne)
++		return -EFAULT;
++	if (get_user(max, ne))
++		return -EFAULT;
++	if (max <= 0)
++		return -EINVAL;
++
++	if (max > nr_threads + 32)
++		max = nr_threads + 32;
++
++	kbuf = kvmalloc_array(max, sizeof(*kbuf), GFP_KERNEL | __GFP_NOWARN);
++	if (!kbuf)
++		return -ENOMEM;
++
++	read_lock(&tasklist_lock);
++	p = &init_task;
++	while (p) {
++		if (n == max) {
++			ret = -ENOSPC;
++			break;
++		}
++
++		child = first_child(p);
++		sib = next_sibling(p);
++		fill(&kbuf[n++], p, child, sib);
++
++		/* Descend, take a sibling, or ascend until a sibling is found. */
++		next = child ? child : sib;
++		while (!next && p != &init_task) {
++			p = p->real_parent->group_leader;
++			next = next_sibling(p);
++		}
++		p = next;
++	}
++	read_unlock(&tasklist_lock);
++
++	if (copy_to_user(buf, kbuf, n * sizeof(*kbuf)))
++		ret = -EFAULT;
++	else if (!ret && put_user(n, ne))
++		ret = -EFAULT;
++	kvfree(kbuf);
++	return ret;
++}
+diff --git a/scripts/syscall.tbl b/scripts/syscall.tbl
+index 7a42b32..9c39c23 100644
+--- a/scripts/syscall.tbl
++++ b/scripts/syscall.tbl
+@@ -412,3 +412,4 @@
+ 469	common	file_setattr			sys_file_setattr
+ 470	common	listns				sys_listns
+ 471	common	rseq_slice_yield		sys_rseq_slice_yield
++472	common	k22tree				sys_k22tree
